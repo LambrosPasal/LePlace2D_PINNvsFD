@@ -1,0 +1,266 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import time
+
+# DOMAIN DISCRITIZATION function
+def grid(N):
+  n = N+2
+  h = 1.0 / (n-1)
+  x = np.linspace(0, 1, n)
+  y = np.linspace(0, 1, n)
+  X, Y = np.meshgrid(x, y, indexing="xy")  
+  return X,Y
+
+# ANALYTIC SOLUTION method
+def V_exact(N):
+  X, Y = grid(N)   # V[j, i]: row j <-> y, column i <-> x
+  V_ex = np.sin(np.pi * X) * np.sinh(np.pi * Y) / np.sinh(np.pi)
+  return V_ex
+
+# FINITE DIFFERENCES method
+def finite_diff(N):
+  X_fd, Y_fd = grid(N)   # V[j, i]: row j <-> y, column i <-> x
+  n = N+2
+  # Initial guess: zero everywhere, then set the boundary values
+  V_fd = np.zeros((n, n))
+  # top row (y = 1): the lid,  bottom row, left column, right column stay 0 (grounded)
+  V_fd[-1, :] = np.sin(np.pi * X_fd[0])    
+
+  tol = 1e-8
+  t0 = time.time()
+  for iteration in range(100_000):
+      V_new = V_fd.copy()
+      # every interior point <- average of its 4 neighbours
+      V_new[1:-1, 1:-1] = 0.25 * (V_fd[1:-1, 2:]+ V_fd[1:-1, :-2]+ V_fd[2:, 1:-1]+ V_fd[:-2, 1:-1])  
+      change = np.abs(V_new - V_fd).max()
+      V_fd = V_new
+      if change < tol:
+          break
+  t_fd = time.time() - t0
+  return V_fd, t_fd
+
+# Settting the GRANULARITY for testing
+N_GRID = 20
+
+# -------- FINITE DIFFERENCES method --------
+X_fd, Y_fd = grid(N_GRID)
+
+V_fd=finite_diff(N_GRID)[0]
+t_fd=finite_diff(N_GRID)[1]
+
+# Analytical solution results
+V_true = V_exact(N_GRID)
+
+# Error of FD & computing time
+err_fd = np.abs(V_fd - V_true)
+print(f"Finite Differences: Max Error: {err_fd.max():.2e}, Mean Error: {err_fd.mean():.2e}, Time: {1000*t_fd:.4f} ms")
+
+fig = plt.figure(figsize=(18, 5.5))
+def surface(ax, N, Z, title, cmap="viridis", zlim=None, zlabel="V"):
+    """Draw Z(x, y) as a 3-D surface on a 3-D axis."""
+    X, Y = grid(N)
+    ax.plot_surface(X, Y, Z, cmap=cmap,
+                    rcount=60, ccount=60,          # max rows/cols drawn: keeps big grids fast
+                    edgecolor="k", linewidth=0.15, # thin grid lines help read the shape
+                    antialiased=True)
+    ax.set_title(title)
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel(zlabel)
+    if zlim is not None:
+        ax.set_zlim(*zlim)
+    ax.view_init(elev=25, azim=-60)                # camera angle: height and rotation
+
+ax = fig.add_subplot(1, 3, 1, projection="3d"); surface(ax, N_GRID, V_fd,   "Finite differences", zlim=(0, 1))
+ax = fig.add_subplot(1, 3, 2, projection="3d"); surface(ax, N_GRID, V_true, "Exact", zlim=(0, 1))
+ax = fig.add_subplot(1, 3, 3, projection="3d"); surface(ax, N_GRID, err_fd, "|FD − exact|",cmap="magma", zlabel="error")
+plt.tight_layout()
+plt.show()
+
+# PINN preparation
+torch.manual_seed(0)
+# Recall we have  N_GRID**2 total points
+# INTERIROR
+# 1-D coordinates strictly INSIDE (0, 1): drop the first and last value (0 and 1)
+g = torch.linspace(0, 1, N_GRID + 2)[1:-1]
+# 2-D grid: every combination of an x-value and a y-value
+X, Y = torch.meshgrid(g, g, indexing="xy")
+# Flatten the two 2-D arrays into one list of (x, y) points
+xy_interior = torch.stack([X.flatten(), Y.flatten()], dim=1)
+
+# BOUNDARY
+# Evenly spaced positions along an edge, INCLUDING the corners (0 and 1)
+e = torch.linspace(0, 1, N_GRID).unsqueeze(1)     # shape (100, 1)
+zeros = torch.zeros_like(e)
+ones  = torch.ones_like(e)
+
+bottom = torch.cat([e, zeros], dim=1)   # y = 0
+top    = torch.cat([e, ones],  dim=1)   # y = 1
+left   = torch.cat([zeros, e], dim=1)   # x = 0
+right  = torch.cat([ones,  e], dim=1)   # x = 1
+
+V_top    = torch.sin(torch.pi * top[:, 0:1])   # V = sin(pi x) on the lid
+V_bottom = torch.zeros_like(e)
+V_left   = torch.zeros_like(e)
+V_right  = torch.zeros_like(e)
+
+xy_boundary = torch.cat([bottom, top, left, right], dim=0)
+V_boundary  = torch.cat([V_bottom, V_top, V_left, V_right], dim=0)
+
+# ------------ PINN Method --------------
+import torch.nn as nn
+class PINN(nn.Module):
+    """Neural network V(x, y): takes (N, 2) points, returns (N, 1) potentials."""
+
+    def __init__(self, input, output, width, depth):
+        super().__init__()
+        layers = []
+        in_features=input                  # input: (x, y)
+        for _ in range(depth):
+            layers.append(nn.Linear(in_features, width))
+            layers.append(nn.Tanh())             # smooth activation - ReLU would NOT work (see below)
+            in_features = width
+        layers.append(nn.Linear(width, output))       # output: V (no activation)
+        self.net = nn.Sequential(*layers)
+
+        for m in self.net:                       # Xavier init: good default for tanh
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, xy):
+        return self.net(xy)
+
+# Defining the custom Poisson based LOSS FUNCTION
+def laplacian(f, xy):
+    """d2f/dx2 + d2f/dy2 at each point. f maps (N, 2) -> (N, 1): the network or any test function."""
+    xy = xy.clone().requires_grad_(True)
+    V = f(xy)
+    dV = torch.autograd.grad(V, xy, torch.ones_like(V), create_graph=True)[0]
+    V_xx = torch.autograd.grad(dV[:, 0:1], xy, torch.ones_like(V), create_graph=True)[0][:, 0:1]
+    V_yy = torch.autograd.grad(dV[:, 1:2], xy, torch.ones_like(V), create_graph=True)[0][:, 1:2]
+    return V_xx + V_yy
+
+def pinn_loss(model):
+    # Rule 1: Laplace's equation inside the box
+    residual = laplacian(model, xy_interior)          # (400, 1)
+    loss_pde = (residual ** 2).mean()
+
+    # Rule 2: the boundary values
+    V_pred_bc = model(xy_boundary)                    # (400, 1)
+    loss_bc = ((V_pred_bc - V_boundary) ** 2).mean()
+
+    return loss_pde, loss_bc
+
+# TRAINING
+# Network dimensions, and hyperparameters
+input=2
+output=1
+width=32
+depth=4
+max_epochs= 20000
+lamda=1e-1
+
+model = PINN(input,output,width,depth)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+history = {"pde": [], "bc": [], "total": []}
+
+t0 = time.time()
+for it in range(max_epochs):
+    optimizer.zero_grad()                         # 1. clear old gradients
+    loss_pde, loss_bc = pinn_loss(model)          # 2. evaluate both rules
+    loss = lamda*loss_pde + loss_bc                     # 3. combine
+    loss.backward()                               # 4. gradients of the loss w.r.t. the WEIGHTS
+    optimizer.step()                              # 5. update the weights
+
+    history["pde"].append(loss_pde.item())
+    history["bc"].append(loss_bc.item())
+    history["total"].append(loss.item())
+
+    if it % 5000 == 0 or it == max_epochs - 1:
+        print(f"iter {it:5d} | total {loss.item():.3e} | PDE {loss_pde.item():.3e} | BC {loss_bc.item():.3e}")
+
+t_pinntrain = time.time() - t0
+print(f"\n PINN Training Time: {t_pinntrain:.4f} s")
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.semilogy(history["total"], label="total", lw=2)
+ax.semilogy(history["pde"],   label="PDE (interior)", lw=1)
+ax.semilogy(history["bc"],    label="BC (edges)",     lw=1)
+ax.set_xlabel("iteration"); ax.set_ylabel("loss (log scale)")
+ax.set_title("PINN training")
+ax.legend(); ax.grid(alpha=0.3, which="both")
+plt.show()
+
+# PINN Validation -  exactly the 20x20 FD grid points (N_GRID=20) 
+t0 = time.time() 
+n = N_GRID+2
+xy_fd = torch.tensor(np.stack([X_fd.flatten(), Y_fd.flatten()], axis=1), dtype=torch.float32)
+with torch.no_grad():
+    V_pinn = model(xy_fd).numpy().reshape(n,n)
+t_pinnval=time.time()-t0;
+
+V_true   = V_exact(N_GRID)
+err_fd   = np.abs(V_fd   - V_true)
+err_pinn = np.abs(V_pinn - V_true)
+diff     = np.abs(V_pinn - V_fd)
+
+v_lim = (0, 1) # same height scale for all solutions
+e_lim = (0, max(err_fd.max(), err_pinn.max(), diff.max()))  # same height scale for all errors
+
+fig = plt.figure(figsize=(18, 11))
+# Top row: the three solutions
+for k, (Z, title) in enumerate([(V_fd, "Finite differences"), (V_pinn, "PINN"), (V_true, "Exact")]):
+    ax = fig.add_subplot(2, 3, k + 1, projection="3d")
+    surface(ax, N_GRID, Z, title, zlim=v_lim)
+
+# Bottom row: the errors
+for k, (Z, title) in enumerate([
+        (err_fd,   f"|FD − exact|  (max {err_fd.max():.1e})"),
+        (err_pinn, f"|PINN − exact|  (max {err_pinn.max():.1e})"),
+        (diff,     f"|PINN − FD|  (max {diff.max():.1e})")]):
+    ax = fig.add_subplot(2, 3, k + 4, projection="3d")
+    surface(ax, N_GRID, Z, title, cmap="magma", zlim=e_lim, zlabel="error")
+
+fig.suptitle(f"Laplace in a box, {n}×{n} grid", fontsize=14)
+plt.tight_layout()
+plt.show()
+
+print(f"FD   : Max error: {err_fd.max():.2e}, Mean error: {err_fd.mean():.2e}, Time: {1000*t_fd:.4f}ms")
+print(f"PINN : Max error: {err_pinn.max():.2e}, Mean error: {err_pinn.mean():.2e}, Time: {1000*t_pinnval:.4f}ms")
+
+# PINN Testing
+# testing the net's prediction on a new grid :(N_GRID=200)
+Nn=200
+X_fine, Y_fine = grid(Nn)
+xy_fine = torch.tensor(np.stack([X_fine.flatten(), Y_fine.flatten()], axis=1), dtype=torch.float32)
+
+t0 = time.time()
+with torch.no_grad():
+    V_pinn_fine = model(xy_fine).numpy().reshape(X_fine.shape)
+t_pinntest = time.time() - t0
+
+err_pinn_fine = np.abs(V_pinn_fine - V_exact(Nn))
+print(f"PINN on a 201x201 grid it never saw: Max error: {err_pinn_fine.max():.2e}, "
+      f"Mean error: {err_pinn_fine.mean():.2e}")
+print(f"Evaluating {Nn**2} points took { 1000*t_pinntest:.4f} ms")
+
+# FD on new grid (200x200)
+V_fd_fine = finite_diff(Nn)[0]
+t_fd_fine = finite_diff(Nn)[1]
+err_fd_fine = np.abs(V_fd_fine - V_exact(Nn))
+err_fdpinn_fine=np.abs(V_pinn_fine - V_fd_fine)
+fig = plt.figure(figsize=(13, 11))
+
+# Plotting FD vs PINN error on new grid
+ax = fig.add_subplot(2, 3, 1, projection="3d"); surface(ax, Nn, V_pinn_fine,"PINN (200×200)", zlim=(0, 1))
+ax = fig.add_subplot(2, 3, 2, projection="3d"); surface(ax, Nn, V_fd_fine,"FD (200×200)", zlim=(0, 1))
+ax = fig.add_subplot(2, 3, 3, projection="3d"); surface(ax, Nn, V_exact(Nn),"Exact (200×200)", zlim=(0, 1))
+
+e_lim = (0, max(err_fd.max(), err_pinn.max()))
+ax = fig.add_subplot(2, 3, 4, projection="3d"); surface(ax, Nn, err_pinn_fine, "|PINN − exact|", cmap="magma", zlim=e_lim, zlabel="error")
+ax = fig.add_subplot(2, 3, 5, projection="3d"); surface(ax, Nn, err_fd_fine,   "|FD − exact|",   cmap="magma", zlim=e_lim, zlabel="error")
+ax = fig.add_subplot(2, 3, 6, projection="3d"); surface(ax, Nn, err_fdpinn_fine,   "|PINN - FD|",   cmap="magma", zlim=e_lim, zlabel="error")
+
+plt.tight_layout()
+plt.show()
